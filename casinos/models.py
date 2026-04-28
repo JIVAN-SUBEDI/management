@@ -7,6 +7,8 @@ class Casino(models.Model):
     contact_email = models.EmailField(blank=True, null=True)
     contact_phone = models.CharField(max_length=30, blank=True, null=True)
     chatwoot_inbox_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    fb_id = models.CharField(max_length=100, blank=True, null=True, unique=True)
+    fb_access_token = models.TextField( blank=True, null=True,)
     address = models.TextField(blank=True, null=True)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)

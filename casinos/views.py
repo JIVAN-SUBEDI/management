@@ -397,10 +397,7 @@ class ChatwootWebhookView(APIView):
         data = request.data
 
         print("\n=== CHATWOOT WEBHOOK RECEIVED ===")
-        # print("Headers:")
-        # print(json.dumps(dict(request.headers), indent=2))
-        # print("Payload:")
-        # print(json.dumps(data, indent=2))
+
         print("=================================\n")
 
         # Optional: verify Chatwoot signature
@@ -471,6 +468,11 @@ class ChatwootWebhookView(APIView):
         if not content:
             print("Ignoring empty text")
             return
+        is_private = data.get("private", False)
+
+        if is_private:
+            print("Ignoring private note")
+            return
         if message_type == "outgoing":
             parsed = self.parse_transaction_message(content)
         else:
@@ -479,25 +481,6 @@ class ChatwootWebhookView(APIView):
             print("Message pattern not matched")
             return
 
-        # -----------------------------
-        # Mapping Chatwoot -> old FB logic
-        # -----------------------------
-        #
-        # We need:
-        #   1. casino identifier (like old page_id)
-        #   2. customer external id (like old fb_user_id)
-        #
-        # Recommended:
-        #   - map casino using Chatwoot inbox id
-        #   - map customer using contact_inbox.source_id if available
-        #
-        # Why?
-        #   - inbox.id is stable per connected Chatwoot inbox
-        #   - contact_inbox.source_id is the external source identifier for that contact
-        #
-        # If you want zero model changes, you can store this external contact id
-        # in Customer.fb_user_id as a compatibility field.
-        # -----------------------------
 
         inbox_id = str(inbox.get("id") or conversation.get("inbox_id") or "")
         customer_external_id = str(
@@ -505,7 +488,7 @@ class ChatwootWebhookView(APIView):
             or sender_meta.get("id")
             or ""
         )
-        print(inbox_id)
+        # print(inbox_id)
         if not inbox_id:
             raise Exception("No Chatwoot inbox id found")
 
@@ -623,7 +606,8 @@ class ChatwootWebhookView(APIView):
         inbox_id: str,
         customer_external_id: str,
         customer_name: str,
-        staff_code: str | None,
+        staff_user=None,
+        staff_code: str | None = None,
         payment_method_name: str,
         platform_name: str,
         amount: Decimal,
@@ -636,44 +620,54 @@ class ChatwootWebhookView(APIView):
         payment_method = PaymentMethod.objects.filter(
             name__iexact=payment_method_name
         ).first()
+
         if not payment_method:
             raise Exception(f"Payment method '{payment_method_name}' not found")
 
         platform = Platforms.objects.filter(
             name__iexact=platform_name
         ).first()
+
         if not platform:
             raise Exception(f"Platform '{platform_name}' not found")
 
-        # Reuse fb_user_id field for compatibility if you don't want schema change yet
         customer = Customer.objects.filter(
             fb_user_id=customer_external_id,
-            casino=casino
+            casino=casino,
         ).first()
 
         if not customer:
             full_name = (customer_name or "").strip() or f"chatwoot-user-{customer_external_id}"
-            username = self.generate_unique_username(full_name)
+            username = self.generate_unique_username_for_casino(full_name, casino)
 
             customer = Customer.objects.create(
                 fullname=full_name,
                 username=username,
-                fb_user_id=customer_external_id,  # compatibility reuse
+                fb_user_id=customer_external_id,
                 casino=casino,
-                notes="Created automatically from Chatwoot webhook",
+                notes="Created automatically from Chatwoot",
             )
-            print(f"Created customer: {customer.fullname} ({customer.username})")
 
         added_by = None
-        if staff_code:
+
+        if staff_user:
+            has_access = staff_user.casinos.filter(id=casino.id).exists()
+
+            if has_access and getattr(staff_user, "is_active", False):
+                added_by = staff_user
+            else:
+                print(
+                    f"⚠ Logged-in user {staff_user.id} does not have access to casino {casino.id}"
+                )
+
+        elif staff_code:
             added_by = User.objects.filter(
                 staff_code__iexact=staff_code,
-                casino=casino
-            ).first()
-            if not added_by:
-                print(f"⚠ Staff with code '{staff_code}' not found in this casino, added_by will be null")
+                casinos__id=casino.id,
+                is_active=True,
+            ).distinct().first()
 
-        note_prefix = "Chatwoot echo message" if is_echo else "Chatwoot incoming message"
+        note_prefix = "Chatwoot private transaction note" if is_echo else "Chatwoot webhook transaction"
 
         Transaction.objects.create(
             customer=customer,
@@ -687,7 +681,18 @@ class ChatwootWebhookView(APIView):
             payment_method=payment_method,
         )
 
-        if added_by:
-            print(f"✅ Transaction created by staff: {added_by.staff_code}")
-        else:
-            print("✅ Transaction created with added_by = null")
+        return customer
+    def generate_unique_username_for_casino(self, full_name: str, casino):
+        base = slugify(full_name).strip("-")
+
+        if not base:
+            base = "chatwoot-user"
+
+        username = base
+        counter = 1
+
+        while Customer.objects.filter(username=username, casino=casino).exists():
+            username = f"{base}-{counter}"
+            counter += 1
+
+        return username

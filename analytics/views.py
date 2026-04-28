@@ -1,16 +1,56 @@
 from datetime import timedelta, date
 from decimal import Decimal
 
-from django.db.models import Count, Sum, Q,Avg
+from django.db.models import Count, Sum, Q, Avg
 from django.utils import timezone
 from rest_framework import permissions, status
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
-from customer.models import Customer, Transaction,PaymentMethod,Platforms
+from customer.models import Customer, Transaction, PaymentMethod, Platforms
 from casinos.models import Casino
 from django.contrib.auth import get_user_model
+
 User = get_user_model()
+
+
+def get_casino_param(request):
+    return request.query_params.get("casino_id") or request.query_params.get("casino")
+
+
+def user_has_casino_access(user, casino_id):
+    if user.role == "super_admin":
+        return Casino.objects.filter(id=casino_id).exists()
+
+    return user.casinos.filter(id=casino_id).exists()
+
+
+def get_selected_casino_or_response(user, casino_id):
+    if not casino_id:
+        return None, None
+
+    if not user_has_casino_access(user, casino_id):
+        return None, Response(
+            {"detail": "You do not have access to this casino."},
+            status=status.HTTP_403_FORBIDDEN,
+        )
+
+    casino = Casino.objects.filter(id=casino_id).first()
+    if not casino:
+        return None, Response(
+            {"detail": "Casino not found."},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+
+    return casino, None
+
+
+def get_user_casinos_qs(user):
+    if user.role == "super_admin":
+        return Casino.objects.all()
+    return user.casinos.all()
+
+
 class CasinoAdminDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -22,12 +62,10 @@ class CasinoAdminDashboardView(APIView):
             return period, today, today
 
         if period == "week":
-            start_date = today - timedelta(days=6)
-            return period, start_date, today
+            return period, today - timedelta(days=6), today
 
         if period == "month":
-            start_date = today.replace(day=1)
-            return period, start_date, today
+            return period, today.replace(day=1), today
 
         if period == "custom":
             start_str = request.query_params.get("start_date")
@@ -51,23 +89,6 @@ class CasinoAdminDashboardView(APIView):
 
     def build_revenue_overview(self, transactions, period, start_date, end_date):
         revenue_overview = []
-
-        if period == "today":
-            day_qs = transactions.filter(date=start_date)
-            deposits = day_qs.filter(
-                type=Transaction.TransactionType.DEPOSIT
-            ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
-
-            withdrawals = day_qs.filter(
-                type=Transaction.TransactionType.WITHDRAW
-            ).aggregate(total=Sum("amount"))["total"] or Decimal("0.00")
-
-            revenue_overview.append({
-                "label": start_date.strftime("%d %b"),
-                "deposits": float(deposits),
-                "withdrawals": float(withdrawals),
-            })
-            return revenue_overview
 
         current = start_date
         while current <= end_date:
@@ -94,42 +115,54 @@ class CasinoAdminDashboardView(APIView):
     def get(self, request, *args, **kwargs):
         user = request.user
 
-        if user.role not in ["casino_admin", "staff"]:
+        if user.role not in ["casino_admin", "staff", "super_admin"]:
             return Response(
-                {"detail": "Only casino admin or staff can access this dashboard."},
+                {"detail": "You do not have permission to access this dashboard."},
                 status=status.HTTP_403_FORBIDDEN,
             )
 
-        if not user.casino:
-            return Response(
-                {"detail": "User is not assigned to any casino."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        casino_id = get_casino_param(request)
 
+        selected_casino = None
+
+        if casino_id:
+            selected_casino, error_response = get_selected_casino_or_response(user, casino_id)
+            if error_response:
+                return error_response
         period, start_date, end_date = self.get_date_range(request)
         if not period:
             return Response(
                 {
                     "detail": "Invalid date filter. Use period=today|week|month|custom. "
-                              "For custom, provide start_date and end_date in YYYY-MM-DD format."
+                    "For custom, provide start_date and end_date in YYYY-MM-DD format."
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        casino = user.casino
         today = timezone.localdate()
-        if user.role == "casino_admin":
-            all_transactions = Transaction.objects.filter(casino=casino)
-        elif user.role == "staff":
-            all_transactions = Transaction.objects.filter(casino=casino, added_by=user)
-        else:
-            return Response(
-                {"detail": "You do not have permission to access this dashboard."},
-                status=403,
-            )
 
-        filtered_transactions = all_transactions.filter(date__gte=start_date, date__lte=end_date)
-        customers = Customer.objects.filter(casino=casino)
+        all_transactions = Transaction.objects.select_related(
+            "customer", "casino", "platform", "payment_method", "added_by"
+        )
+
+        customers = Customer.objects.select_related("casino")
+
+        if selected_casino:
+            all_transactions = all_transactions.filter(casino=selected_casino)
+            customers = customers.filter(casino=selected_casino)
+        elif user.role == "super_admin":
+            pass
+        else:
+            all_transactions = all_transactions.filter(casino__in=user.casinos.all())
+            customers = customers.filter(casino__in=user.casinos.all())
+
+        if user.role == "staff":
+            all_transactions = all_transactions.filter(added_by=user)
+
+        filtered_transactions = all_transactions.filter(
+            date__gte=start_date,
+            date__lte=end_date,
+        )
 
         total_deposits = filtered_transactions.filter(
             type=Transaction.TransactionType.DEPOSIT
@@ -141,7 +174,6 @@ class CasinoAdminDashboardView(APIView):
 
         net_profit = total_deposits - total_withdrawals
 
-        # still useful as "today" cards even if period is week/month/custom
         todays_deposits = all_transactions.filter(
             type=Transaction.TransactionType.DEPOSIT,
             date=today,
@@ -157,7 +189,10 @@ class CasinoAdminDashboardView(APIView):
         ).distinct().count()
 
         revenue_overview = self.build_revenue_overview(
-            filtered_transactions, period, start_date, end_date
+            filtered_transactions,
+            period,
+            start_date,
+            end_date,
         )
 
         payment_method_breakdown = list(
@@ -165,9 +200,10 @@ class CasinoAdminDashboardView(APIView):
             .annotate(value=Sum("amount"))
             .order_by("-value")
         )
+
         payment_method_breakdown = [
             {
-                "name": row["payment_method__name"],
+                "name": row["payment_method__name"] or "Unknown",
                 "value": float(row["value"] or 0),
             }
             for row in payment_method_breakdown
@@ -222,15 +258,20 @@ class CasinoAdminDashboardView(APIView):
             })
 
         data = {
-            "casino": {
-                "id": casino.id,
-                "name": casino.name,
-                "code": casino.code,
-            },
+            "casino": (
+                {
+                    "id": selected_casino.id,
+                    "name": selected_casino.name,
+                    "code": selected_casino.code,
+                }
+                if selected_casino
+                else None
+            ),
             "filters": {
                 "period": period,
                 "start_date": start_date,
                 "end_date": end_date,
+                "casino_id": casino_id,
             },
             "stats": {
                 "total_deposits": float(total_deposits),
@@ -248,7 +289,6 @@ class CasinoAdminDashboardView(APIView):
         }
 
         return Response(data)
-
 
 
 class AnalyticsView(APIView):
@@ -290,6 +330,7 @@ class AnalyticsView(APIView):
     def build_daily_deposits(self, transactions, start_date, end_date):
         rows = []
         current = start_date
+
         while current <= end_date:
             amount = transactions.filter(
                 type=Transaction.TransactionType.DEPOSIT,
@@ -300,12 +341,15 @@ class AnalyticsView(APIView):
                 "day": current.strftime("%d %b"),
                 "amount": float(amount),
             })
+
             current += timedelta(days=1)
+
         return rows
 
     def build_revenue_overview(self, transactions, start_date, end_date):
         rows = []
         current = start_date
+
         while current <= end_date:
             deposits = transactions.filter(
                 type=Transaction.TransactionType.DEPOSIT,
@@ -322,7 +366,9 @@ class AnalyticsView(APIView):
                 "deposits": float(deposits),
                 "withdrawals": float(withdrawals),
             })
+
             current += timedelta(days=1)
+
         return rows
 
     def get(self, request, *args, **kwargs):
@@ -341,60 +387,64 @@ class AnalyticsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        casino_id = request.query_params.get("casino")
+        casino_id = get_casino_param(request)
+        selected_casino = None
 
-        if user.role == "casino_admin":
-            selected_casino = user.casino
-            if not selected_casino:
-                return Response(
-                    {"detail": "Casino admin is not assigned to a casino."},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            transactions = Transaction.objects.filter(casino=selected_casino)
-            customers = Customer.objects.filter(casino=selected_casino)
+        transactions = Transaction.objects.select_related(
+            "customer", "casino", "platform", "payment_method", "added_by"
+        )
+        customers = Customer.objects.select_related("casino")
+
+        if casino_id:
+            selected_casino, error_response = get_selected_casino_or_response(user, casino_id)
+            if error_response:
+                return error_response
+
+            transactions = transactions.filter(casino=selected_casino)
+            customers = customers.filter(casino=selected_casino)
             scope = "single"
         else:
-            # super_admin
-            if casino_id:
-                try:
-                    selected_casino = Casino.objects.get(pk=casino_id)
-                except Casino.DoesNotExist:
-                    return Response(
-                        {"detail": "Casino not found."},
-                        status=status.HTTP_404_NOT_FOUND,
-                    )
-                transactions = Transaction.objects.filter(casino=selected_casino)
-                customers = Customer.objects.filter(casino=selected_casino)
-                scope = "single"
-            else:
-                selected_casino = None
-                transactions = Transaction.objects.all()
-                customers = Customer.objects.all()
+            if user.role == "casino_admin":
+                transactions = transactions.filter(casino__in=user.casinos.all())
+                customers = customers.filter(casino__in=user.casinos.all())
+                scope = "assigned"
+            elif user.role == "super_admin":
                 scope = "all"
+            else:
+                return Response(
+                    {"detail": "You do not have permission to access analytics."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
 
-        filtered_transactions = transactions.filter(date__gte=start_date, date__lte=end_date)
+        filtered_transactions = transactions.filter(
+            date__gte=start_date,
+            date__lte=end_date,
+        )
 
-        deposits_per_day = self.build_daily_deposits(filtered_transactions, start_date, end_date)
-        revenue_overview = self.build_revenue_overview(filtered_transactions, start_date, end_date)
+        deposits_per_day = self.build_daily_deposits(
+            filtered_transactions,
+            start_date,
+            end_date,
+        )
 
-        platform_breakdown_qs = (
-            filtered_transactions.values("platform__name")
+        revenue_overview = self.build_revenue_overview(
+            filtered_transactions,
+            start_date,
+            end_date,
+        )
+
+        platform_breakdown = [
+            {"name": row["platform__name"] or "Unknown", "value": float(row["value"] or 0)}
+            for row in filtered_transactions.values("platform__name")
             .annotate(value=Sum("amount"))
             .order_by("-value")
-        )
-        platform_breakdown = [
-            {"name": row["platform__name"], "value": float(row["value"] or 0)}
-            for row in platform_breakdown_qs
         ]
 
-        payment_method_qs = (
-            filtered_transactions.values("payment_method__name")
+        payment_method_breakdown = [
+            {"name": row["payment_method__name"] or "Unknown", "value": float(row["value"] or 0)}
+            for row in filtered_transactions.values("payment_method__name")
             .annotate(value=Sum("amount"))
             .order_by("-value")
-        )
-        payment_method_breakdown = [
-            {"name": row["payment_method__name"], "value": float(row["value"] or 0)}
-            for row in payment_method_qs
         ]
 
         profit_by_casino = []
@@ -430,6 +480,7 @@ class AnalyticsView(APIView):
                 "period": period,
                 "start_date": start_date,
                 "end_date": end_date,
+                "casino_id": casino_id,
             },
             "charts": {
                 "deposits_per_day": deposits_per_day,
@@ -441,6 +492,8 @@ class AnalyticsView(APIView):
         }
 
         return Response(data)
+
+
 class ReportsView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -490,6 +543,9 @@ class ReportsView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
+        casino_id = get_casino_param(request)
+        selected_casino = None
+
         queryset = Transaction.objects.select_related(
             "customer",
             "casino",
@@ -498,28 +554,32 @@ class ReportsView(APIView):
             "added_by",
         ).filter(date__gte=start_date, date__lte=end_date)
 
-        # role-based access
-        if user.role == "staff":
-            queryset = queryset.filter(added_by=user)
-        elif user.role == "casino_admin":
-            queryset = queryset.filter(casino=user.casino)
-        elif user.role == "super_admin":
-            pass
-        else:
-            return Response(
-                {"detail": "You do not have permission to access reports."},
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        if casino_id:
+            selected_casino, error_response = get_selected_casino_or_response(user, casino_id)
+            if error_response:
+                return error_response
 
-        # optional filters
-        casino_id = request.query_params.get("casino")
+            queryset = queryset.filter(casino=selected_casino)
+        else:
+            if user.role == "staff":
+                queryset = queryset.filter(
+                    casino__in=user.casinos.all(),
+                    added_by=user,
+                )
+            elif user.role == "casino_admin":
+                queryset = queryset.filter(casino__in=user.casinos.all())
+            elif user.role == "super_admin":
+                pass
+            else:
+                return Response(
+                    {"detail": "You do not have permission to access reports."},
+                    status=status.HTTP_403_FORBIDDEN,
+                )
+
         staff_id = request.query_params.get("staff")
         platform_id = request.query_params.get("platform")
         payment_method_id = request.query_params.get("payment_method")
         tx_type = request.query_params.get("type")
-
-        if user.role == "super_admin" and casino_id:
-            queryset = queryset.filter(casino_id=casino_id)
 
         if user.role in ["super_admin", "casino_admin"] and staff_id:
             queryset = queryset.filter(added_by_id=staff_id)
@@ -555,19 +615,33 @@ class ReportsView(APIView):
                 "staff_name": tx.added_by.full_name if tx.added_by else None,
                 "type": tx.type,
                 "amount": float(tx.amount),
-                "platform_name": tx.platform.name,
-                "payment_method_name": tx.payment_method.name,
+                "platform_name": tx.platform.name if tx.platform else None,
+                "payment_method_name": tx.payment_method.name if tx.payment_method else None,
                 "notes": tx.notes or "",
             }
             for tx in queryset.order_by("-date", "-id")
         ]
+
+        if user.role == "super_admin":
+            casino_lookup = Casino.objects.filter(is_active=True)
+            staff_lookup = User.objects.filter(role__in=["casino_admin", "staff"])
+        else:
+            casino_lookup = user.casinos.filter(is_active=True)
+            staff_lookup = User.objects.filter(
+                role__in=["casino_admin", "staff"],
+                casinos__in=user.casinos.all(),
+            ).distinct()
+
+        if selected_casino:
+            casino_lookup = casino_lookup.filter(id=selected_casino.id)
+            staff_lookup = staff_lookup.filter(casinos=selected_casino)
 
         data = {
             "filters": {
                 "period": period,
                 "start_date": start_date,
                 "end_date": end_date,
-                "casino": casino_id,
+                "casino_id": casino_id,
                 "staff": staff_id,
                 "platform": platform_id,
                 "payment_method": payment_method_id,
@@ -583,26 +657,19 @@ class ReportsView(APIView):
             },
             "rows": rows,
             "lookups": {
-                "casinos": list(
-                    Casino.objects.filter(is_active=True).values("id", "name")
-                ) if user.role == "super_admin" else [],
+                "casinos": list(casino_lookup.values("id", "name")),
                 "staff": list(
-                    User.objects.filter(
-                        role__in=["casino_admin", "staff"],
-                        casino=user.casino if user.role == "casino_admin" else None
-                    ).values("id", "full_name", "role", "casino_id")
-                ) if user.role == "casino_admin" else list(
-                    User.objects.filter(
-                        role__in=["casino_admin", "staff"]
-                    ).values("id", "full_name", "role", "casino_id")
-                ) if user.role == "super_admin" else [],
-                "platforms": list(Platforms.objects.filter().values("id","name")),
-                "payment_methods": list(PaymentMethod.objects.filter().values("id", "name")),
+                    staff_lookup.values("id", "full_name", "role")
+                ),
+                "platforms": list(Platforms.objects.all().values("id", "name")),
+                "payment_methods": list(PaymentMethod.objects.all().values("id", "name")),
             },
             "generated_at": timezone.now(),
         }
 
         return Response(data)
+
+
 class SuperAdminDashboardView(APIView):
     permission_classes = [permissions.IsAuthenticated]
 
@@ -680,7 +747,16 @@ class SuperAdminDashboardView(APIView):
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
-        casino_id = request.query_params.get("casino")
+        casino_id = get_casino_param(request)
+
+        selected_casino = None
+        if casino_id:
+            selected_casino = Casino.objects.filter(id=casino_id).first()
+            if not selected_casino:
+                return Response(
+                    {"detail": "Casino not found."},
+                    status=status.HTTP_404_NOT_FOUND,
+                )
 
         transactions = Transaction.objects.select_related(
             "customer",
@@ -688,19 +764,22 @@ class SuperAdminDashboardView(APIView):
             "platform",
             "payment_method",
             "added_by",
-        ).all()
+        )
 
         customers = Customer.objects.all()
         casinos = Casino.objects.all()
         staff_users = User.objects.filter(role__in=["casino_admin", "staff"])
 
-        if casino_id:
-            transactions = transactions.filter(casino_id=casino_id)
-            customers = customers.filter(casino_id=casino_id)
-            casinos = casinos.filter(id=casino_id)
-            staff_users = staff_users.filter(casino_id=casino_id)
+        if selected_casino:
+            transactions = transactions.filter(casino=selected_casino)
+            customers = customers.filter(casino=selected_casino)
+            casinos = casinos.filter(id=selected_casino.id)
+            staff_users = staff_users.filter(casinos=selected_casino)
 
-        filtered_transactions = transactions.filter(date__gte=start_date, date__lte=end_date)
+        filtered_transactions = transactions.filter(
+            date__gte=start_date,
+            date__lte=end_date,
+        )
 
         total_deposits = filtered_transactions.filter(
             type=Transaction.TransactionType.DEPOSIT
@@ -716,7 +795,7 @@ class SuperAdminDashboardView(APIView):
             transactions__date__gte=timezone.localdate() - timedelta(days=4)
         ).distinct().count()
 
-        total_staff = staff_users.count()
+        total_staff = staff_users.distinct().count()
 
         revenue_overview = self.build_revenue_overview(
             filtered_transactions,
@@ -725,7 +804,9 @@ class SuperAdminDashboardView(APIView):
         )
 
         profit_by_casino = []
-        for casino in Casino.objects.all().order_by("name"):
+        casino_profit_qs = casinos.order_by("name")
+
+        for casino in casino_profit_qs:
             casino_tx = filtered_transactions.filter(casino=casino)
 
             deposits = casino_tx.filter(
@@ -741,7 +822,7 @@ class SuperAdminDashboardView(APIView):
                 "profit": float(deposits - withdrawals),
             })
 
-        casino_performance_qs = Customer.objects.values(
+        casino_performance_qs = customers.values(
             "casino_id",
             "casino__name",
         ).annotate(
@@ -768,6 +849,7 @@ class SuperAdminDashboardView(APIView):
         for row in casino_performance_qs:
             deposits = row["total_deposits"] or Decimal("0.00")
             withdrawals = row["total_withdrawals"] or Decimal("0.00")
+
             casino_performance.append({
                 "casino_id": row["casino_id"],
                 "name": row["casino__name"],
@@ -786,7 +868,7 @@ class SuperAdminDashboardView(APIView):
                 "customer_name": tx.customer.fullname,
                 "type": tx.type,
                 "amount": float(tx.amount),
-                "platform_name": tx.platform.name,
+                "platform_name": tx.platform.name if tx.platform else None,
             }
             for tx in filtered_transactions.order_by("-date", "-id")[:8]
         ]
@@ -796,10 +878,10 @@ class SuperAdminDashboardView(APIView):
                 "period": period,
                 "start_date": start_date,
                 "end_date": end_date,
-                "casino": casino_id,
+                "casino_id": casino_id,
             },
             "stats": {
-                "total_casinos": Casino.objects.count() if not casino_id else 1,
+                "total_casinos": casinos.count(),
                 "total_deposits": float(total_deposits),
                 "total_withdrawals": float(total_withdrawals),
                 "net_profit": float(net_profit),

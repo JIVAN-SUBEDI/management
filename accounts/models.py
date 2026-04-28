@@ -2,7 +2,7 @@ from django.db import models
 from django.db.models import Q
 from django.contrib.auth.models import AbstractBaseUser, PermissionsMixin
 from django.core.exceptions import ValidationError
-
+from django.conf import settings
 from .managers import UserManager
 
 
@@ -22,10 +22,8 @@ class User(AbstractBaseUser, PermissionsMixin):
     fb_user_access_token = models.TextField(blank=True, null=True)
     fb_oauth_state = models.CharField(max_length=255, null=True, blank=True)
 
-    casino = models.ForeignKey(
+    casinos = models.ManyToManyField(
         "casinos.Casino",
-        on_delete=models.SET_NULL,
-        null=True,
         blank=True,
         related_name="users",
     )
@@ -41,24 +39,17 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     class Meta:
         ordering = ["-date_joined"]
-        constraints = [
-            models.UniqueConstraint(
-                fields=["casino"],
-                condition=Q(role="casino_admin"),
-                name="unique_casino_admin_per_casino",
-            )
-        ]
 
-    def clean(self):
-        if self.role == "super_admin" and self.casino is not None:
-            raise ValidationError({"casino": "Super admin cannot belong to a casino."})
 
-        if self.role in ["casino_admin", "staff"] and self.casino is None:
-            raise ValidationError({"casino": "Casino is required for this role."})
+    # def clean(self):
+    #     if self.role == "super_admin" and self.casinos.exists():
+    #         raise ValidationError({"casinos": "Super admin cannot belong to any casino."})
+
+    #     if self.role in ["casino_admin", "staff"] and not self.casinos.exists():
+    #         raise ValidationError({"casinos": "At least one casino is required for this role."})
 
     def save(self, *args, **kwargs):
         if self.role == "super_admin":
-            self.casino = None
             self.is_staff = True
         elif self.role == "casino_admin":
             self.is_staff = True
@@ -68,3 +59,32 @@ class User(AbstractBaseUser, PermissionsMixin):
 
     def __str__(self):
         return f"{self.full_name} - {self.email}"
+class UserDevice(models.Model):
+    DEVICE_TYPE_CHOICES = (
+        ("android", "Android"),
+        ("ios", "iOS"),
+        ("web", "Web"),
+    )
+
+    user = models.ForeignKey(
+        settings.AUTH_USER_MODEL,
+        on_delete=models.CASCADE,
+        related_name="devices"
+    )
+
+    fcm_token = models.TextField(unique=True)
+
+    device_type = models.CharField(
+        max_length=10,
+        choices=DEVICE_TYPE_CHOICES,
+        blank=True,
+        null=True
+    )
+
+    is_active = models.BooleanField(default=True)
+
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    def __str__(self):
+        return f"{self.user} - {self.device_type}"

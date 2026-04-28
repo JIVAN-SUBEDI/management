@@ -31,15 +31,27 @@ ALLOWED_HOSTS = [
     "johnworkspace.com",
     "www.johnworkspace.com",
     "localhost",
-    "b183-2400-1a00-1b64-96cb-a53b-5840-25c2-3509.ngrok-free.app",
+    # "192.168.1.8",
+    # "192.168.1.90",
+    # "192.168.1.7",
+    # "172.20.10.8",
+    # "903b-2400-1a00-1b6a-8407-48cf-991d-f010-eaea.ngrok-free.app",
+    # "bf06-62-197-144-134.ngrok-free.app",
+    # "b7fc-2407-1400-aa6c-6d88-6a-9996-f8bd-ba7f.ngrok-free.app",
+    # "payments",
 ]
 
 
 
+# Example callback URLs
+SITE_BASE_URL = "http://127.0.0.1:8000"
+
+FRONTEND_URL = "https://johnworkspace.com"
 CHATWOOT_BASE_URL ="https://app.chatwoot.com"
 CHATWOOT_ACCOUNT_ID="158846"
 CHATWOOT_API_ACCESS_TOKEN="ymnkWKugY5HqrgeURaM3Ppyn"
-
+# CHATWOOT_WEBHOOK_SECRET_CHATS="aUTqeWvbBCE2eA4VgE6LygEk"
+FIREBASE_SERVICE_ACCOUNT_FILE = BASE_DIR / "firebase.json"
 FACEBOOK_SCOPES = [
     "pages_show_list",
     "pages_read_engagement",
@@ -52,21 +64,23 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'channels',
     'rest_framework',
     'accounts',
     'casinos',
     'customer',
     'analytics',
+    'chats',
 ]
 AUTH_USER_MODEL = "accounts.User"
 MIDDLEWARE = [
     "corsheaders.middleware.CorsMiddleware",
 
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
+
     "django.contrib.sessions.middleware.SessionMiddleware",
-
     "django.middleware.common.CommonMiddleware",
-
     "django.middleware.csrf.CsrfViewMiddleware",
     "django.contrib.auth.middleware.AuthenticationMiddleware",
     "django.contrib.messages.middleware.MessageMiddleware",
@@ -75,10 +89,22 @@ MIDDLEWARE = [
 
 ROOT_URLCONF = 'backend.urls'
 CORS_ALLOW_ALL_ORIGINS=True
+CORS_ALLOW_HEADERS = [
+    "accept",
+    "authorization",
+    "content-type",
+    "user-agent",
+    "x-csrftoken",
+    "x-requested-with",
+    "ngrok-skip-browser-warning",
+]
 TEMPLATES = [
     {
         'BACKEND': 'django.template.backends.django.DjangoTemplates',
-        'DIRS': [BASE_DIR / 'templates'],
+        'DIRS': [
+            BASE_DIR / 'templates',
+            BASE_DIR / 'static',
+        ],
         'APP_DIRS': True,
         'OPTIONS': {
             'context_processors': [
@@ -138,11 +164,18 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 STATIC_ROOT = os.path.join(BASE_DIR,'staticfiles')
-STATIC_URL = '/static/'
+STATIC_URL = "/static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
 
 STATICFILES_DIRS = [
-    os.path.join(BASE_DIR,'static')
+    BASE_DIR / "static",
 ]
+
+STORAGES = {
+    "staticfiles": {
+        "BACKEND": "whitenoise.storage.CompressedStaticFilesStorage",
+    },
+}
 # CORS_ALLOW_ALL_ORIGINS = True
 REST_FRAMEWORK = {
     "DEFAULT_AUTHENTICATION_CLASSES": (
@@ -158,4 +191,14 @@ MEDIA_ROOT = BASE_DIR / "media"
 SIMPLE_JWT = {
     "TOKEN_OBTAIN_SERIALIZER": "accounts.serializers.CustomTokenObtainPairSerializer",
     "TOKEN_REFRESH_SERIALIZER": "accounts.serializers.CustomTokenRefreshSerializer",
+}
+# CHATWOOT_BASE_URL = "https://app.chatwoot.com"   # or your self-hosted url
+# CHATWOOT_ACCOUNT_ID = 158846
+# CHATWOOT_API_ACCESS_TOKEN = "ymnkWKugY5HqrgeURaM3Ppyn"
+ASGI_APPLICATION = "backend.asgi.application"
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels.layers.InMemoryChannelLayer",
+    }
 }

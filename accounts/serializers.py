@@ -1,16 +1,20 @@
 from rest_framework import serializers
-from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.serializers import (
     TokenObtainPairSerializer,
     TokenRefreshSerializer,
 )
 from rest_framework_simplejwt.tokens import RefreshToken
 from rest_framework_simplejwt.exceptions import InvalidToken
+
 from .models import User
+from casinos.models import Casino
+from casinos.serializers import CasinoSerializer
+
 
 
 class UserSerializer(serializers.ModelSerializer):
-    casino_name = serializers.CharField(source="casino.name", read_only=True)
+    casinos = CasinoSerializer(many=True, read_only=True)
+    casino_name = serializers.SerializerMethodField()
     password = serializers.CharField(write_only=True, required=False, min_length=6)
 
     class Meta:
@@ -24,12 +28,16 @@ class UserSerializer(serializers.ModelSerializer):
             "password",
             "role",
             "staff_code",
-            "casino",
+            "casinos",
             "casino_name",
             "is_active",
             "date_joined",
         ]
-        read_only_fields = ["id", "date_joined", "casino_name"]
+        read_only_fields = ["id", "date_joined", "casino_name", "casinos"]
+
+    def get_casino_name(self, obj):
+        first_casino = obj.casinos.first()
+        return first_casino.name if first_casino else None
 
     def update(self, instance, validated_data):
         password = validated_data.pop("password", None)
@@ -46,6 +54,11 @@ class UserSerializer(serializers.ModelSerializer):
 
 class CreateUserSerializer(serializers.ModelSerializer):
     password = serializers.CharField(write_only=True, min_length=6)
+    casinos = serializers.PrimaryKeyRelatedField(
+        queryset=Casino.objects.all(),
+        many=True,
+        required=False,
+    )
 
     class Meta:
         model = User
@@ -58,7 +71,7 @@ class CreateUserSerializer(serializers.ModelSerializer):
             "staff_code",
             "password",
             "role",
-            "casino",
+            "casinos",
             "is_active",
         ]
         read_only_fields = ["id"]
@@ -68,7 +81,7 @@ class CreateUserSerializer(serializers.ModelSerializer):
         creator = request.user
 
         role = attrs.get("role")
-        selected_casino = attrs.get("casino")
+        selected_casinos = attrs.get("casinos", [])
 
         if creator.role == "super_admin":
             if role == "super_admin":
@@ -76,9 +89,9 @@ class CreateUserSerializer(serializers.ModelSerializer):
                     "role": "Use management command/admin to create another super admin."
                 })
 
-            if role in ["casino_admin", "staff"] and not selected_casino:
+            if role in ["casino_admin", "staff"] and not selected_casinos:
                 raise serializers.ValidationError({
-                    "casino": "Casino must be assigned by super admin."
+                    "casinos": "At least one casino must be assigned."
                 })
 
         elif creator.role == "casino_admin":
@@ -87,8 +100,13 @@ class CreateUserSerializer(serializers.ModelSerializer):
                     "role": "Casino admin can only create staff."
                 })
 
-            # casino admin does not choose arbitrary casino
-            attrs["casino"] = creator.casino
+            creator_casinos = list(creator.casinos.all())
+            if not creator_casinos:
+                raise serializers.ValidationError({
+                    "detail": "Casino admin is not assigned to any casino."
+                })
+
+            attrs["casinos"] = creator_casinos
 
         else:
             raise serializers.ValidationError({
@@ -99,8 +117,14 @@ class CreateUserSerializer(serializers.ModelSerializer):
 
     def create(self, validated_data):
         password = validated_data.pop("password")
-        return User.objects.create_user(password=password, **validated_data)
+        casinos = validated_data.pop("casinos", [])
 
+        user = User.objects.create_user(password=password, **validated_data)
+
+        if casinos:
+            user.casinos.set(casinos)
+
+        return user
 
 
 class ChangePasswordSerializer(serializers.Serializer):
@@ -114,6 +138,8 @@ class ChangePasswordSerializer(serializers.Serializer):
                 "confirm_password": "Passwords do not match."
             })
         return attrs
+
+
 class UpdateProfileSerializer(serializers.ModelSerializer):
     class Meta:
         model = User
@@ -139,31 +165,79 @@ class UpdateProfileSerializer(serializers.ModelSerializer):
         if value is None:
             return ""
         return value.strip()
+
+
 class CustomTokenObtainPairSerializer(TokenObtainPairSerializer):
+    def get_user_casinos(self, user):
+        if user.role == "super_admin":
+            casinos = Casino.objects.all()
+        else:
+            casinos = user.casinos.all()
+
+        return [
+            {
+                "id": str(casino.id),
+                "name": casino.name,
+                "chatwoot_inbox_id": casino.chatwoot_inbox_id,
+            }
+            for casino in casinos
+        ]
+
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
+
+        if user.role == "super_admin":
+            casinos = Casino.objects.all()
+        else:
+            casinos = user.casinos.all()
+
+        first_casino = casinos.first()
+
         token["token_version"] = user.token_version
         token["user_id"] = str(user.id)
         token["role"] = user.role
         token["full_name"] = user.full_name
-        token["casino_id"] = user.casino_id
-        token["casino_name"] = user.casino.name if user.casino else None
+        token["casinos"] = [
+            {
+                "id": str(casino.id),
+                "name": casino.name,
+                "chatwoot_inbox_id": casino.chatwoot_inbox_id,
+            }
+            for casino in casinos
+        ]
+
         return token
 
     def validate(self, attrs):
         data = super().validate(attrs)
 
+        if self.user.role == "super_admin":
+            casinos = Casino.objects.all()
+        else:
+            casinos = self.user.casinos.all()
+
+        first_casino = casinos.first()
+
         data["user"] = {
-            "id": self.user.id,
+            "id": str(self.user.id),
             "full_name": self.user.full_name,
             "email": self.user.email,
             "role": self.user.role,
-            "casino_id": self.user.casino_id,
-            "casino_name": self.user.casino.name if self.user.casino else None,
+            "casino_id": str(first_casino.id) if first_casino else None,
+            "casino_name": first_casino.name if first_casino else None,
+            "casinos": [
+                {
+                    "id": str(casino.id),
+                    "name": casino.name,
+                    "chatwoot_inbox_id": casino.chatwoot_inbox_id,
+                }
+                for casino in casinos
+            ],
         }
 
         return data
+
 
 class CustomTokenRefreshSerializer(TokenRefreshSerializer):
     def validate(self, attrs):

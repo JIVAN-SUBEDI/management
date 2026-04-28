@@ -12,6 +12,9 @@ from .serializers import (
     UpdateProfileSerializer
 )
 from backend.permissions import IsSuperAdminOrCasinoAdmin
+from rest_framework.views import APIView
+from .models import UserDevice
+
 
 def index(request):
     return render(request, 'index.html')
@@ -36,10 +39,14 @@ class UserViewSet(viewsets.ModelViewSet):
         user = self.request.user
 
         if user.role == "super_admin":
-            return User.objects.select_related("casino").all()
+            return User.objects.prefetch_related("casinos").all()
 
         if user.role == "casino_admin":
-            return User.objects.select_related("casino").filter(casino=user.casino)
+            return (
+                User.objects.prefetch_related("casinos")
+                .filter(casinos__in=user.casinos.all())
+                .distinct()
+            )
 
         return User.objects.none()
 
@@ -52,7 +59,7 @@ class UserViewSet(viewsets.ModelViewSet):
         current_user = self.request.user
 
         if current_user.role == "casino_admin":
-            serializer.save(casino=current_user.casino)
+            serializer.save()
         elif current_user.role == "super_admin":
             serializer.save()
         else:
@@ -67,16 +74,24 @@ class UserViewSet(viewsets.ModelViewSet):
         )
 
         if current_user.role == "casino_admin":
-            if target_user.role != "staff" or target_user.casino != current_user.casino:
-                raise PermissionDenied("You can only update your own casino staff.")
+            if target_user.role != "staff":
+                raise PermissionDenied("You can only update staff users.")
 
-            updated_user = serializer.save(casino=current_user.casino)
+            shared_casino_exists = target_user.casinos.filter(
+                id__in=current_user.casinos.values_list("id", flat=True)
+            ).exists()
+
+            if not shared_casino_exists:
+                raise PermissionDenied("You can only update staff from your own casino.")
+
+            updated_user = serializer.save()
         else:
             updated_user = serializer.save()
 
         if password_changed:
             updated_user.token_version += 1
             updated_user.save(update_fields=["token_version"])
+
     def destroy(self, request, *args, **kwargs):
         current_user = request.user
         target_user = self.get_object()
@@ -86,11 +101,17 @@ class UserViewSet(viewsets.ModelViewSet):
                 raise PermissionDenied("You can't delete yourself.")
 
         if current_user.role == "casino_admin":
-            if target_user.role != "staff" or target_user.casino != current_user.casino:
-                raise PermissionDenied("You can only delete your own casino staff.")
+            if target_user.role != "staff":
+                raise PermissionDenied("You can only delete staff users.")
+
+            shared_casino_exists = target_user.casinos.filter(
+                id__in=current_user.casinos.values_list("id", flat=True)
+            ).exists()
+
+            if not shared_casino_exists:
+                raise PermissionDenied("You can only delete staff from your own casino.")
 
         return super().destroy(request, *args, **kwargs)
-    
 class ChangePasswordView(generics.GenericAPIView):
     serializer_class = ChangePasswordSerializer
     permission_classes = [permissions.IsAuthenticated]
@@ -124,3 +145,47 @@ class UpdateProfileView(generics.UpdateAPIView):
 
     def get_object(self):
         return self.request.user
+    
+class SaveExpoTokenView(APIView):
+    permission_classes = [permissions.IsAuthenticated]
+
+    def post(self, request):
+        token = request.data.get("fcm_token") or request.data.get("expo_token")
+        device_type = request.data.get("device_type") or request.data.get("platform")
+
+        if not token:
+            return Response(
+                {
+                    "success": False,
+                    "message": "fcm_token or expo_token is required",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if device_type and device_type not in ["android", "ios", "web"]:
+            return Response(
+                {
+                    "success": False,
+                    "message": "Invalid device_type. Use android, ios, or web.",
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        device, created = UserDevice.objects.update_or_create(
+            fcm_token=token,
+            defaults={
+                "user": request.user,
+                "device_type": device_type,
+                "is_active": True,
+            },
+        )
+
+        return Response(
+            {
+                "success": True,
+                "message": "Token saved successfully",
+                "created": created,
+                "device_id": device.id,
+            },
+            status=status.HTTP_200_OK,
+        )

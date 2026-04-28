@@ -5,14 +5,27 @@ from django.db.models import Sum
 from django.utils import timezone
 from rest_framework import serializers
 
-from .models import Customer, Transaction
 from casinos.models import Casino
+from .models import Customer, Transaction
+
+
+def user_has_casino_access(user, casino):
+    if not casino:
+        return False
+
+    if user.role == "super_admin":
+        return True
+
+    return user.casinos.filter(id=casino.id).exists()
+
 
 class CustomerSerializer(serializers.ModelSerializer):
     casino_name = serializers.CharField(source="casino.name", read_only=True)
+
     casino = serializers.PrimaryKeyRelatedField(
         queryset=Casino.objects.all(),
-        required=False
+        required=False,
+        allow_null=True,
     )
 
     txn_count = serializers.IntegerField(read_only=True)
@@ -48,9 +61,44 @@ class CustomerSerializer(serializers.ModelSerializer):
             "total_deposit",
             "total_withdrawal",
             "tags",
+            "txn_count",
             "created_at",
             "updated_at",
         ]
+
+    def validate(self, attrs):
+        request = self.context.get("request")
+        user = request.user if request else None
+
+        casino = attrs.get("casino", getattr(self.instance, "casino", None))
+
+        casino_id = None
+        if request:
+            casino_id = (
+                request.data.get("casino")
+                or request.data.get("casino_id")
+                or request.query_params.get("casino_id")
+            )
+
+        if casino_id and not casino:
+            casino = Casino.objects.filter(id=casino_id).first()
+            if not casino:
+                raise serializers.ValidationError({
+                    "casino_id": "Casino not found."
+                })
+            attrs["casino"] = casino
+
+        if not casino and not self.instance:
+            raise serializers.ValidationError({
+                "casino_id": "casino_id is required."
+            })
+
+        if user and casino and not user_has_casino_access(user, casino):
+            raise serializers.ValidationError({
+                "casino_id": "You do not have access to this casino."
+            })
+
+        return attrs
 
     def get_last_activity(self, obj):
         last_tx = obj.transactions.order_by("-date", "-id").first()
@@ -91,8 +139,10 @@ class CustomerSerializer(serializers.ModelSerializer):
             tags.append("inactive")
 
         is_regular = False
+
         if len(deposits) >= 2:
             day_gaps = []
+
             for i in range(1, len(deposits)):
                 gap = (deposits[i].date - deposits[i - 1].date).days
                 day_gaps.append(gap)
@@ -106,6 +156,8 @@ class CustomerSerializer(serializers.ModelSerializer):
                 tags.append("vip")
 
         return tags
+
+
 class TransactionSerializer(serializers.ModelSerializer):
     customer_name = serializers.CharField(source="customer.fullname", read_only=True)
     casino_name = serializers.CharField(source="casino.name", read_only=True)
@@ -115,7 +167,8 @@ class TransactionSerializer(serializers.ModelSerializer):
 
     casino = serializers.PrimaryKeyRelatedField(
         queryset=Casino.objects.all(),
-        required=False
+        required=False,
+        allow_null=True,
     )
 
     class Meta:
@@ -150,54 +203,66 @@ class TransactionSerializer(serializers.ModelSerializer):
         ]
 
     def validate(self, attrs):
-        request = self.context["request"]
-        user = request.user
+        request = self.context.get("request")
+        user = request.user if request else None
 
         customer = attrs.get("customer", getattr(self.instance, "customer", None))
         casino = attrs.get("casino", getattr(self.instance, "casino", None))
 
-        # auto-force casino for casino_admin / staff
-        if user.role in ["casino_admin", "staff"]:
-            if not user.casino:
-                raise serializers.ValidationError({
-                    "casino": "User is not assigned to any casino."
-                })
+        casino_id = None
+        if request:
+            casino_id = (
+                request.data.get("casino")
+                or request.data.get("casino_id")
+                or request.query_params.get("casino_id")
+            )
 
-            attrs["casino"] = user.casino
-            casino = user.casino
-
-        # require casino only for super_admin
-        elif user.role == "super_admin":
+        if casino_id and not casino:
+            casino = Casino.objects.filter(id=casino_id).first()
             if not casino:
                 raise serializers.ValidationError({
-                    "casino": "Casino is required for super admin."
+                    "casino_id": "Casino not found."
                 })
+            attrs["casino"] = casino
 
-        # customer must belong to same casino
+        if not casino and customer:
+            casino = customer.casino
+            attrs["casino"] = casino
+
+        if not casino and not self.instance:
+            raise serializers.ValidationError({
+                "casino_id": "casino_id is required."
+            })
+
+        if user and casino and not user_has_casino_access(user, casino):
+            raise serializers.ValidationError({
+                "casino_id": "You do not have access to this casino."
+            })
+
         if customer and casino and customer.casino_id != casino.id:
             raise serializers.ValidationError({
                 "customer": "Customer does not belong to the selected casino."
             })
 
-        # restricted roles can only use own casino customers
-        if user.role in ["casino_admin", "staff"] and customer:
-            if customer.casino_id != user.casino_id:
-                raise serializers.ValidationError({
-                    "customer": "You can only use customers from your own casino."
-                })
-
         return attrs
 
     def create(self, validated_data):
-        request = self.context["request"]
-        validated_data["added_by"] = request.user
+        request = self.context.get("request")
+
+        if request:
+            validated_data["added_by"] = request.user
+
         return super().create(validated_data)
 
     def update(self, instance, validated_data):
-        request = self.context["request"]
-        user = request.user
+        request = self.context.get("request")
+        user = request.user if request else None
 
-        if user.role in ["casino_admin", "staff"]:
-            validated_data["casino"] = user.casino
+        casino = validated_data.get("casino", instance.casino)
+
+        if user and casino and not user_has_casino_access(user, casino):
+            raise serializers.ValidationError({
+                "casino_id": "You do not have access to this casino."
+            })
 
         return super().update(instance, validated_data)

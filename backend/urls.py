@@ -9,5 +9,7 @@ urlpatterns = [
     path("api/", include("casinos.urls")),
     path("api/", include("customer.urls")),
     path("api/", include("analytics.urls")),
+    path("api/", include("chats.urls")),
+
     re_path(r"^(?!api/|admin/|static/).*$", TemplateView.as_view(template_name="index.html"))
 ]

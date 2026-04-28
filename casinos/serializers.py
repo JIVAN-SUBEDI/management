@@ -10,6 +10,8 @@ class CasinoSerializer(serializers.ModelSerializer):
             "name",
             "code",
             "chatwoot_inbox_id",
+            "fb_id",
+            "fb_access_token",
             "contact_email",
             "contact_phone",
             "address",
@@ -17,6 +19,11 @@ class CasinoSerializer(serializers.ModelSerializer):
             "created_at",
         ]
         read_only_fields = ["id", "created_at"]
+
+        # ❗ Hide token in GET responses
+        extra_kwargs = {
+            "fb_access_token": {"write_only": True}
+        }
 class PaymentMethodSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentMethod
