@@ -20,6 +20,7 @@ from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
 from accounts.models import UserDevice
 from .firebase import send_fcm_to_tokens
 from casinos.models import Casino
+from concurrent.futures import ThreadPoolExecutor, as_completed
 class ChatwootConversationFullView(APIView):
     permission_classes = [IsAuthenticated]
 
@@ -822,12 +823,18 @@ class ChatwootWebhookView(APIView):
             broadcast_to_list(event)
 
         return Response({"success": True}, status=status.HTTP_200_OK)
+
+
 class ChatwootConversationListView(APIView):
     permission_classes = [IsAuthenticated]
 
     DEFAULT_PAGE_SIZE = 20
     MAX_PAGE_SIZE = 100
     MAX_CHATWOOT_PAGES_TO_SCAN = 10
+
+    DEFAULT_MESSAGE_LIMIT = 20
+    MAX_MESSAGE_LIMIT = 50
+    MAX_PARALLEL_MESSAGE_REQUESTS = 8
 
     def get_chatwoot_headers(self):
         return {
@@ -878,15 +885,22 @@ class ChatwootConversationListView(APIView):
             "content_type": message.get("content_type"),
             "message_type": message.get("message_type"),
             "created_at": message.get("created_at"),
+            "updated_at": message.get("updated_at"),
+            "private": message.get("private", False),
             "status": message.get("status"),
+            "sender_type": message.get("sender_type"),
+            "sender_id": message.get("sender_id"),
+            "processed_message_content": message.get("processed_message_content"),
+            "content_attributes": message.get("content_attributes", {}),
+            "attachments": message.get("attachments", []),
             "sender": {
                 "id": sender.get("id"),
                 "name": sender.get("name"),
                 "email": sender.get("email"),
                 "phone_number": sender.get("phone_number"),
                 "thumbnail": sender.get("thumbnail"),
+                "type": sender.get("type"),
             },
-            "attachments": message.get("attachments", []),
         }
 
     def format_conversation(self, convo):
@@ -928,6 +942,7 @@ class ChatwootConversationListView(APIView):
                 "name": team.get("name"),
             } if team else None,
             "last_message": self.format_message(last_message),
+            "messages": [],
             "custom_attributes": convo.get("custom_attributes", {}),
             "additional_attributes": convo.get("additional_attributes", {}),
         }
@@ -952,6 +967,7 @@ class ChatwootConversationListView(APIView):
 
         params = {
             "page": page,
+            "sort_order": "latest_first",
         }
 
         if status_value:
@@ -970,6 +986,92 @@ class ChatwootConversationListView(APIView):
             timeout=20,
         )
 
+    def chatwoot_list_messages(self, conversation_id, limit=20):
+        base_url = settings.CHATWOOT_BASE_URL.rstrip("/")
+        account_id = settings.CHATWOOT_ACCOUNT_ID
+
+        url = (
+            f"{base_url}/api/v1/accounts/{account_id}"
+            f"/conversations/{conversation_id}/messages"
+        )
+
+        return requests.get(
+            url,
+            headers=self.get_chatwoot_headers(),
+            params={
+                "limit": limit,
+            },
+            timeout=20,
+        )
+
+    def get_latest_messages_for_conversation(self, conversation_id, limit=20):
+        try:
+            resp = self.chatwoot_list_messages(
+                conversation_id=conversation_id,
+                limit=limit,
+            )
+
+            if resp.status_code != 200:
+                return []
+
+            data = resp.json()
+            messages = data.get("payload", [])
+
+            latest_messages = sorted(
+                messages,
+                key=lambda m: m.get("created_at", 0),
+                reverse=True,
+            )[:limit]
+
+            latest_messages.reverse()
+
+            return [
+                self.format_message(message)
+                for message in latest_messages
+            ]
+
+        except Exception:
+            return []
+
+    def attach_latest_messages(self, conversations, message_limit=20):
+        if not conversations:
+            return []
+
+        try:
+            message_limit = int(message_limit)
+        except (TypeError, ValueError):
+            message_limit = self.DEFAULT_MESSAGE_LIMIT
+
+        message_limit = max(1, min(message_limit, self.MAX_MESSAGE_LIMIT))
+
+        formatted_results = [
+            self.format_conversation(convo)
+            for convo in conversations
+        ]
+
+        with ThreadPoolExecutor(
+            max_workers=self.MAX_PARALLEL_MESSAGE_REQUESTS
+        ) as executor:
+            future_map = {
+                executor.submit(
+                    self.get_latest_messages_for_conversation,
+                    convo["id"],
+                    message_limit,
+                ): convo
+                for convo in formatted_results
+                if convo.get("id")
+            }
+
+            for future in as_completed(future_map):
+                convo = future_map[future]
+
+                try:
+                    convo["messages"] = future.result()
+                except Exception:
+                    convo["messages"] = []
+
+        return formatted_results
+
     def build_chatwoot_error_response(self, resp):
         return Response(
             {
@@ -984,13 +1086,26 @@ class ChatwootConversationListView(APIView):
     def get(self, request, *args, **kwargs):
         try:
             page = max(int(request.query_params.get("page", 1)), 1)
+
             page_size = int(
                 request.query_params.get("page_size", self.DEFAULT_PAGE_SIZE)
             )
             page_size = max(1, min(page_size, self.MAX_PAGE_SIZE))
+
+            message_limit = int(
+                request.query_params.get(
+                    "message_limit",
+                    self.DEFAULT_MESSAGE_LIMIT,
+                )
+            )
+            message_limit = max(1, min(message_limit, self.MAX_MESSAGE_LIMIT))
+
         except ValueError:
             return Response(
-                {"success": False, "message": "Invalid page or page_size"},
+                {
+                    "success": False,
+                    "message": "Invalid page, page_size, or message_limit",
+                },
                 status=status.HTTP_400_BAD_REQUEST,
             )
 
@@ -1008,7 +1123,10 @@ class ChatwootConversationListView(APIView):
 
             if error:
                 return Response(
-                    {"success": False, "message": error},
+                    {
+                        "success": False,
+                        "message": error,
+                    },
                     status=(
                         status.HTTP_403_FORBIDDEN
                         if error == "Access denied for this casino"
@@ -1016,8 +1134,6 @@ class ChatwootConversationListView(APIView):
                     ),
                 )
 
-            # FAST PATH 1:
-            # Super admin + All Pages = direct Chatwoot all conversations
             if is_super_admin and not casino_id:
                 resp = self.chatwoot_list_conversations(
                     page=page,
@@ -1029,6 +1145,7 @@ class ChatwootConversationListView(APIView):
                     return self.build_chatwoot_error_response(resp)
 
                 payload, meta = self.extract_payload_and_meta(resp.json())
+                conversations = payload[:page_size]
 
                 return Response(
                     {
@@ -1036,6 +1153,7 @@ class ChatwootConversationListView(APIView):
                         "source": "chatwoot_direct_all",
                         "page": page,
                         "page_size": page_size,
+                        "message_limit": message_limit,
                         "filters": {
                             "status": status_value,
                             "q": q,
@@ -1043,17 +1161,15 @@ class ChatwootConversationListView(APIView):
                             "inbox_ids": None,
                         },
                         "meta": meta,
-                        "count": len(payload[:page_size]),
-                        "results": [
-                            self.format_conversation(c)
-                            for c in payload[:page_size]
-                        ],
+                        "count": len(conversations),
+                        "results": self.attach_latest_messages(
+                            conversations,
+                            message_limit=message_limit,
+                        ),
                     },
                     status=status.HTTP_200_OK,
                 )
 
-            # FAST PATH 2:
-            # Selected single casino/page = direct Chatwoot inbox_id filter
             if target_inbox_ids and len(target_inbox_ids) == 1:
                 inbox_id = target_inbox_ids[0]
 
@@ -1068,6 +1184,7 @@ class ChatwootConversationListView(APIView):
                     return self.build_chatwoot_error_response(resp)
 
                 payload, meta = self.extract_payload_and_meta(resp.json())
+                conversations = payload[:page_size]
 
                 return Response(
                     {
@@ -1075,6 +1192,7 @@ class ChatwootConversationListView(APIView):
                         "source": "chatwoot_direct_inbox",
                         "page": page,
                         "page_size": page_size,
+                        "message_limit": message_limit,
                         "filters": {
                             "status": status_value,
                             "q": q,
@@ -1082,17 +1200,15 @@ class ChatwootConversationListView(APIView):
                             "inbox_ids": [inbox_id],
                         },
                         "meta": meta,
-                        "count": len(payload[:page_size]),
-                        "results": [
-                            self.format_conversation(c)
-                            for c in payload[:page_size]
-                        ],
+                        "count": len(conversations),
+                        "results": self.attach_latest_messages(
+                            conversations,
+                            message_limit=message_limit,
+                        ),
                     },
                     status=status.HTTP_200_OK,
                 )
 
-            # FALLBACK:
-            # Staff with multiple allowed inboxes = scan + filter
             allowed_inbox_ids = set(target_inbox_ids or [])
 
             if not allowed_inbox_ids:
@@ -1102,6 +1218,7 @@ class ChatwootConversationListView(APIView):
                         "source": "django_filtered_scan",
                         "page": page,
                         "page_size": page_size,
+                        "message_limit": message_limit,
                         "filters": {
                             "status": status_value,
                             "q": q,
@@ -1174,6 +1291,7 @@ class ChatwootConversationListView(APIView):
                     "source": "django_filtered_scan",
                     "page": page,
                     "page_size": page_size,
+                    "message_limit": message_limit,
                     "filters": {
                         "status": status_value,
                         "q": q,
@@ -1190,10 +1308,10 @@ class ChatwootConversationListView(APIView):
                         ),
                     },
                     "count": len(paged_results),
-                    "results": [
-                        self.format_conversation(c)
-                        for c in paged_results
-                    ],
+                    "results": self.attach_latest_messages(
+                        paged_results,
+                        message_limit=message_limit,
+                    ),
                 },
                 status=status.HTTP_200_OK,
             )
