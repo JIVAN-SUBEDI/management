@@ -392,6 +392,7 @@ class ChatwootWebhookView(APIView):
         "wd": Transaction.TransactionType.WITHDRAW,
         "withdraw": Transaction.TransactionType.WITHDRAW,
     }
+    AMOUNT_PATTERN = re.compile(r"^\d+(\.\d+)?$")
 
     def post(self, request, *args, **kwargs):
         data = request.data
